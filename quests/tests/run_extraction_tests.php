@@ -25,7 +25,7 @@ function assert_true($cond, $msg) {
 	}
 }
 
-assert_true(ALLACLONE_LUA_QUEST_EXTRACT === '1.4.1', 'extractor version 1.4.1');
+assert_true(ALLACLONE_LUA_QUEST_EXTRACT === '1.5.0', 'extractor version 1.5.0');
 
 // Comment filtering must retain string contents and source locations.
 $commentRaw = file_get_contents($fixtures . '/comments.lua');
@@ -64,6 +64,7 @@ foreach (array("\r\n", "\r") as $newline) {
 $onlyComments = "-- if item_lib.check_turn_in(e.self, e.trade, {item1=9001}) then\n-- eq.spawn2(99999, 0, 0, 1, 2, 3, 0);";
 assert_true(count(parse_lua_text($onlyComments, 'comments-only.lua')['trades']) === 0 && extract_literal_quest_spawns($onlyComments, 'comments-only.lua') === array(), 'comment-only file has no fallback trades or spawns, including EOF comment');
 assert_true(trim(lua_mask_comments('--[=[ unfinished comment')) === '', 'unterminated long comment remains a comment through EOF');
+
 
 $multi = parse_lua_file($fixtures . '/multi_turnin.lua', 'multi_turnin.lua');
 assert_true(count($multi['trades']) === 2, 'multi_turnin extracts 2 trades');
@@ -202,6 +203,56 @@ foreach ($dNamed['death_spawns'] as $e) {
 assert_true($bossEdge !== null && (int)$bossEdge['spawned_npc_id'] === 71058 && $bossEdge['coords_dynamic'] === true, 'named local-const death spawn');
 assert_true($otherEdge !== null && (int)$otherEdge['spawned_npc_id'] === 71060 && $otherEdge['coords_dynamic'] === false && $otherEdge['x'] == -1462.2, 'named literal death spawn');
 
+// Inline anonymous death handlers
+$dInline = parse_lua_file($fixtures . '/death_spawn_inline.lua', 'death_spawn_inline.lua');
+assert_true(count($dInline['death_spawns']) === 3, 'inline death extracts 3 spawn edges');
+$inlineKinds = array();
+foreach ($dInline['unsupported_hints'] as $h) {
+	$inlineKinds[$h['kind']] = true;
+}
+assert_true(!isset($inlineKinds['inline_death_handler']), 'inline handlers no longer reported as unsupported');
+$i48041 = null;
+foreach ($dInline['death_spawns'] as $e) {
+	if ((int)$e['source_npc_id'] === 48041) {
+		$i48041 = $e;
+	}
+}
+assert_true($i48041 !== null && (int)$i48041['spawned_npc_id'] === 48374 && $i48041['coords_dynamic'] === true, 'inline 48041→48374');
+
+// One-level helper call-graph death spawns
+$dHelp = parse_lua_file($fixtures . '/death_spawn_helper.lua', 'death_spawn_helper.lua');
+assert_true(count($dHelp['death_spawns']) === 2, 'helper death extracts 2 edges');
+$h1 = null;
+$h2 = null;
+foreach ($dHelp['death_spawns'] as $e) {
+	if ((int)$e['source_npc_id'] === 48001) {
+		$h1 = $e;
+	}
+	if ((int)$e['source_npc_id'] === 48003) {
+		$h2 = $e;
+	}
+}
+assert_true($h1 !== null && (int)$h1['spawned_npc_id'] === 48003 && isset($h1['via_helper']) && $h1['via_helper'] === 'ActivateAvatar', 'helper dread→fright');
+assert_true($h2 !== null && (int)$h2['spawned_npc_id'] === 48005 && $h2['coords_dynamic'] === true, 'helper fright→terror');
+
+// Loop-variable NPC ids from local int arrays
+$dLoop = parse_lua_file($fixtures . '/death_spawn_loop_table.lua', 'death_spawn_loop_table.lua');
+assert_true(count($dLoop['registered_npc_ids']) === 3, 'loop table expands 3 registered ids');
+sort($dLoop['registered_npc_ids']);
+assert_true($dLoop['registered_npc_ids'] === array(48089, 48383, 48398), 'loop registered ids match table');
+assert_true(count($dLoop['death_spawns']) === 3, 'loop death extracts 3 edges');
+$loopSrc = array();
+foreach ($dLoop['death_spawns'] as $e) {
+	$loopSrc[(int)$e['source_npc_id']] = (int)$e['spawned_npc_id'];
+}
+assert_true(isset($loopSrc[48089]) && $loopSrc[48089] === 48371, 'loop 48089→48371');
+assert_true(isset($loopSrc[48398]) && $loopSrc[48398] === 48371, 'loop 48398→48371');
+$loopKinds = array();
+foreach ($dLoop['unsupported_hints'] as $h) {
+	$loopKinds[$h['kind']] = true;
+}
+assert_true(!isset($loopKinds['unresolved_registration']), 'loop var ids resolved via ipairs table');
+
 // Sirran integration (death edges + timer/combat overlay; no fake death say_branches)
 $sirran = parse_lua_file($fixtures . '/Sirran.lua', 'encounters/Sirran.lua');
 assert_true(!empty($sirran['has_named_say_trade']), 'Sirran named handlers');
@@ -274,7 +325,9 @@ fwrite(STDOUT, "\nLimitations (by design):\n");
 fwrite(STDOUT, "- Multiline check_turn_in / count_handed_item tables are not extracted.\n");
 fwrite(STDOUT, "- Variable item ids and ChooseRandom/math.random item rewards are not invented.\n");
 fwrite(STDOUT, "- GetFactionValue gates map to NPC primary faction (heuristic).\n");
-fwrite(STDOUT, "- Deep nesting / GetX() dynamic spawns are unsupported.\n");
+fwrite(STDOUT, "- Helper death spawns beyond one call level / ChooseRandom NPC ids unsupported.\n");
+fwrite(STDOUT, "- Loop NPC ids only expand for for _, id in ipairs(local_int_array).\n");
+fwrite(STDOUT, "- GetX() dynamic spawn coords stay null (edges still recorded).\n");
 fwrite(STDOUT, "- ipairs loop register_npc_event NPC ids without literal/const 3rd arg are unresolved.\n");
 fwrite(STDOUT, "- count_handed_item multi-id arrays are listed as Give items (OR vs AND approximate).\n");
 fwrite(STDOUT, "\n$pass passed, $fail failed\n");

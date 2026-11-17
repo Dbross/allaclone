@@ -5,11 +5,12 @@
  *
  * Heuristic limits: offline regex / balanced-slice extraction; misses
  * concatenated strings, variable item ids, deep nesting, dynamic spawn /
- * MovePC coords, and non-literal register_npc_event NPC ids (e.g. bare loop vars).
+ * MovePC coords, and non-literal register_npc_event NPC ids outside
+ * ipairs(local-int-array) loops.
  */
 
 if (!defined('ALLACLONE_LUA_QUEST_EXTRACT')) {
-	define('ALLACLONE_LUA_QUEST_EXTRACT', '1.4.1');
+	define('ALLACLONE_LUA_QUEST_EXTRACT', '1.5.0');
 }
 
 function normalize_npc_key($name) {
@@ -240,17 +241,12 @@ function lua_offset_to_line($text, $offset) {
 }
 
 /**
- * Find top-level function Name(...) ... end body text (excluding the end line).
- * Returns array(body_text, start_offset, end_offset) or null.
+ * Parse body of a Lua function starting at the `function` keyword offset.
+ * Returns array(body_text, body_start, end_keyword_offset, paren_open, paren_close) or null.
+ * Callers should pass comment-masked text when scanning whole scripts.
  */
-function extract_lua_function_body($text, $funcName) {
-	$text = lua_mask_comments($text);
-	$re = '/\bfunction\s+' . preg_quote($funcName, '/') . '\s*\(/i';
-	if (!preg_match($re, $text, $m, PREG_OFFSET_CAPTURE)) {
-		return null;
-	}
-	$fnStart = $m[0][1];
-	$parenOpen = strpos($text, '(', $fnStart);
+function extract_lua_function_body_at($text, $fnKeywordOffset) {
+	$parenOpen = strpos($text, '(', $fnKeywordOffset);
 	if ($parenOpen === false) {
 		return null;
 	}
@@ -286,7 +282,6 @@ function extract_lua_function_body($text, $funcName) {
 			$i++;
 			continue;
 		}
-		// Word-boundary keyword scan
 		if (preg_match('/\G\b(function|if|for|while|repeat)\b/i', $text, $km, 0, $i)) {
 			$depth++;
 			$i += strlen($km[0]);
@@ -304,7 +299,7 @@ function extract_lua_function_body($text, $funcName) {
 			$depth--;
 			if ($depth === 0) {
 				$body = substr($text, $bodyStart, $i - $bodyStart);
-				return array($body, $bodyStart, $i);
+				return array($body, $bodyStart, $i, $parenOpen, $parenClose);
 			}
 			$i += strlen($em[0]);
 			continue;
@@ -312,6 +307,108 @@ function extract_lua_function_body($text, $funcName) {
 		$i++;
 	}
 	return null;
+}
+
+/**
+ * Find top-level function Name(...) ... end body text (excluding the end line).
+ * Returns array(body_text, start_offset, end_offset) or null.
+ */
+function extract_lua_function_body($text, $funcName) {
+	$text = lua_mask_comments($text);
+	$re = '/\bfunction\s+' . preg_quote($funcName, '/') . '\s*\(/i';
+	if (!preg_match($re, $text, $m, PREG_OFFSET_CAPTURE)) {
+		return null;
+	}
+	$info = extract_lua_function_body_at($text, $m[0][1]);
+	if ($info === null) {
+		return null;
+	}
+	return array($info[0], $info[1], $info[2]);
+}
+
+/** Parameter names inside function(...); null entries for non-simple params. */
+function extract_lua_param_names($text, $parenOpen, $parenClose) {
+	$inside = substr($text, $parenOpen + 1, $parenClose - $parenOpen - 1);
+	$params = array();
+	if (trim($inside) === '') {
+		return $params;
+	}
+	foreach (explode(',', $inside) as $p) {
+		$p = trim($p);
+		if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $p)) {
+			$params[] = $p;
+		} else {
+			$params[] = null;
+		}
+	}
+	return $params;
+}
+
+/** Resolve a simple Lua int token (digits or local const). */
+function resolve_lua_int_token($token, $locals) {
+	$token = trim($token);
+	if ($token === '') {
+		return null;
+	}
+	if (ctype_digit($token)) {
+		return (int)$token;
+	}
+	if (isset($locals[$token])) {
+		return (int)$locals[$token];
+	}
+	return null;
+}
+
+/**
+ * local NAME = { 123, 456, ... } int array tables (first assignment wins).
+ */
+function extract_lua_local_int_arrays($text) {
+	$map = array();
+	if (!preg_match_all('/\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{([^}]*)\}/s', $text, $m, PREG_SET_ORDER)) {
+		return $map;
+	}
+	foreach ($m as $hit) {
+		if (isset($map[$hit[1]])) {
+			continue;
+		}
+		$ids = array();
+		if (preg_match_all('/\b(\d{3,})\b/', $hit[2], $nums)) {
+			foreach ($nums[1] as $n) {
+				$ids[] = (int)$n;
+			}
+		}
+		if (count($ids) > 0) {
+			$map[$hit[1]] = $ids;
+		}
+	}
+	return $map;
+}
+
+/**
+ * Expand for _, var in ipairs(ARRAY) registrations into per-id bindings.
+ */
+function expand_binding_from_ipairs_loop($text, $binding, $arrays) {
+	$token = $binding['npc_token'];
+	$offset = isset($binding['_match_offset']) ? (int)$binding['_match_offset'] : 0;
+	$windowStart = max(0, $offset - 1200);
+	$window = substr($text, $windowStart, $offset - $windowStart);
+	$re = '/\bfor\s+_\s*,\s*' . preg_quote($token, '/') . '\s+in\s+ipairs\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/i';
+	if (!preg_match_all($re, $window, $m, PREG_SET_ORDER)) {
+		return null;
+	}
+	$last = $m[count($m) - 1];
+	$arrName = $last[1];
+	if (!isset($arrays[$arrName]) || count($arrays[$arrName]) === 0) {
+		return null;
+	}
+	$out = array();
+	foreach ($arrays[$arrName] as $id) {
+		$b = $binding;
+		$b['npc_id'] = (int)$id;
+		unset($b['_match_offset']);
+		$out[] = $b;
+	}
+	return $out;
 }
 
 /**
@@ -403,7 +500,73 @@ function extract_spawn_calls_as_death_edges($lines, $rel, $locals, $lineOffset, 
 }
 
 /**
- * Death→spawn edges from classic event_death(_complete) and named
+ * One-level helper call-graph: death body calls Helper(args) whose body has spawn2/unique_spawn.
+ * Used when the death handler itself has no direct spawn calls (e.g. ActivateAvatar).
+ */
+function extract_helper_call_death_edges($bodyText, $fullText, $locals, $rel, $lineOffset, $eventKind, $sourceNpcId, &$hints = null) {
+	$out = array();
+	$skip = array(
+		'function' => true, 'if' => true, 'for' => true, 'while' => true, 'repeat' => true,
+		'pairs' => true, 'ipairs' => true, 'tonumber' => true, 'tostring' => true,
+		'type' => true, 'print' => true, 'require' => true, 'select' => true,
+		'assert' => true, 'error' => true, 'pcall' => true, 'xpcall' => true,
+	);
+	if (!preg_match_all('/(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)/', $bodyText, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE)) {
+		return $out;
+	}
+	foreach ($matches as $m) {
+		$fname = $m[1][0];
+		if (isset($skip[strtolower($fname)])) {
+			continue;
+		}
+		$fnRe = '/\bfunction\s+' . preg_quote($fname, '/') . '\s*\(/i';
+		if (!preg_match($fnRe, $fullText, $fm, PREG_OFFSET_CAPTURE)) {
+			continue;
+		}
+		$bodyInfo = extract_lua_function_body_at($fullText, $fm[0][1]);
+		if ($bodyInfo === null) {
+			continue;
+		}
+		$params = extract_lua_param_names($fullText, $bodyInfo[3], $bodyInfo[4]);
+		$argParts = preg_split('/\s*,\s*/', trim($m[2][0]));
+		if ($argParts === false) {
+			$argParts = array();
+		}
+		$bound = $locals;
+		for ($pi = 0; $pi < count($params); $pi++) {
+			if ($params[$pi] === null || !isset($argParts[$pi])) {
+				continue;
+			}
+			$v = resolve_lua_int_token($argParts[$pi], $locals);
+			if ($v !== null) {
+				$bound[$params[$pi]] = $v;
+			}
+		}
+		$helperLines = explode("\n", $bodyInfo[0]);
+		$helperOffset = lua_offset_to_line($fullText, $bodyInfo[1]) - 1;
+		$callLine = $lineOffset + lua_offset_to_line($bodyText, $m[0][1]);
+		foreach (extract_spawn_calls_as_death_edges($helperLines, $rel, $bound, $helperOffset, $eventKind, $sourceNpcId, $hints) as $edge) {
+			$edge['via_helper'] = $fname;
+			$edge['line_no'] = $callLine;
+			$out[] = $edge;
+		}
+	}
+	return $out;
+}
+
+/**
+ * Collect death→spawn edges from a callback body (direct spawns, else one-level helpers).
+ */
+function death_edges_from_callback_body($bodyLines, $bodyText, $fullText, $locals, $rel, $lineOffset, $eventKind, $sourceNpcId, &$hints = null) {
+	$direct = extract_spawn_calls_as_death_edges($bodyLines, $rel, $locals, $lineOffset, $eventKind, $sourceNpcId, $hints);
+	if (count($direct) > 0) {
+		return $direct;
+	}
+	return extract_helper_call_death_edges($bodyText, $fullText, $locals, $rel, $lineOffset, $eventKind, $sourceNpcId, $hints);
+}
+
+/**
+ * Death→spawn edges from classic event_death(_complete) and named/inline
  * Event.death / Event.death_complete register_npc_event callbacks.
  */
 function extract_death_spawn_edges($text, $rel, &$hints = null) {
@@ -418,7 +581,8 @@ function extract_death_spawn_edges($text, $rel, &$hints = null) {
 		if (count($bodyLines) === 0) {
 			continue;
 		}
-		foreach (extract_spawn_calls_as_death_edges($bodyLines, $rel, $locals, $start, $eventKind, null, $hints) as $edge) {
+		$bodyText = implode("\n", $bodyLines);
+		foreach (death_edges_from_callback_body($bodyLines, $bodyText, $text, $locals, $rel, $start, $eventKind, null, $hints) as $edge) {
 			$out[] = $edge;
 		}
 	}
@@ -441,8 +605,17 @@ function extract_death_spawn_edges($text, $rel, &$hints = null) {
 			}
 			continue;
 		}
+		$eventKind = ($ev === 'death_complete') ? 'death_complete' : 'death';
+		$sourceNpcId = (int)$b['npc_id'];
+		if (!empty($b['inline_body'])) {
+			$bodyLines = explode("\n", $b['inline_body']);
+			$lineOffset = lua_offset_to_line($text, (int)$b['inline_body_start']) - 1;
+			foreach (death_edges_from_callback_body($bodyLines, $b['inline_body'], $text, $locals, $rel, $lineOffset, $eventKind, $sourceNpcId, $hints) as $edge) {
+				$out[] = $edge;
+			}
+			continue;
+		}
 		if ($b['callback'] === null || $b['callback'] === '') {
-			// Inline / anonymous death handlers are not extracted.
 			if (is_array($hints)) {
 				$hints[] = array(
 					'kind' => 'inline_death_handler',
@@ -460,7 +633,7 @@ function extract_death_spawn_edges($text, $rel, &$hints = null) {
 			} else {
 				$bodyLines = explode("\n", $bodyInfo[0]);
 				$lineOffset = lua_offset_to_line($text, $bodyInfo[1]) - 1;
-				$callbackCache[$cb] = array($bodyLines, $lineOffset);
+				$callbackCache[$cb] = array($bodyLines, $lineOffset, $bodyInfo[0]);
 			}
 		}
 		if ($callbackCache[$cb] === false) {
@@ -474,9 +647,8 @@ function extract_death_spawn_edges($text, $rel, &$hints = null) {
 			}
 			continue;
 		}
-		list($bodyLines, $lineOffset) = $callbackCache[$cb];
-		$eventKind = ($ev === 'death_complete') ? 'death_complete' : 'death';
-		foreach (extract_spawn_calls_as_death_edges($bodyLines, $rel, $locals, $lineOffset, $eventKind, (int)$b['npc_id'], $hints) as $edge) {
+		list($bodyLines, $lineOffset, $bodyText) = $callbackCache[$cb];
+		foreach (death_edges_from_callback_body($bodyLines, $bodyText, $text, $locals, $rel, $lineOffset, $eventKind, $sourceNpcId, $hints) as $edge) {
 			$out[] = $edge;
 		}
 	}
@@ -537,35 +709,74 @@ function extract_literal_quest_spawns($text, $rel) {
 }
 
 /**
- * Parse eq.register_npc_event bindings.
- * Returns list of {event, npc_id|null, npc_token, callback|null, line_no}.
+ * Parse eq.register_npc_event bindings (named callbacks and inline function(...)).
+ * Returns list of {event, npc_id|null, npc_token, callback|null, inline_body|null, inline_body_start|null, line_no}.
+ * Loop vars over local int arrays (for _, id in ipairs(T)) expand to one binding per id.
  */
 function extract_npc_event_bindings($text) {
 	$text = lua_mask_comments($text);
 	$locals = extract_lua_local_int_consts($text);
+	$arrays = extract_lua_local_int_arrays($text);
 	$text = str_replace(array("\r\n", "\r"), "\n", $text);
 	$out = array();
-	$re = '/\beq\.register_npc_event\s*\(\s*[^,]+,\s*Event\.([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*|\d+)\s*(?:,\s*([A-Za-z_][A-Za-z0-9_]*))?\s*\)/i';
+	$re = '/\beq\.register_npc_event\s*\(\s*[^,]+,\s*Event\.([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*|\d+)\s*/i';
 	if (!preg_match_all($re, $text, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE)) {
 		return $out;
 	}
+	$len = strlen($text);
 	foreach ($matches as $m) {
 		$event = strtolower($m[1][0]);
 		$token = $m[2][0];
+		$matchStart = $m[0][1];
+		$i = $matchStart + strlen($m[0][0]);
 		$npcId = null;
 		if (ctype_digit($token)) {
 			$npcId = (int)$token;
 		} elseif (isset($locals[$token])) {
 			$npcId = $locals[$token];
 		}
-		$callback = isset($m[3]) && $m[3][0] !== '' ? $m[3][0] : null;
-		$out[] = array(
+		$callback = null;
+		$inlineBody = null;
+		$inlineBodyStart = null;
+		while ($i < $len && ctype_space($text[$i])) {
+			$i++;
+		}
+		if ($i < $len && $text[$i] === ',') {
+			$i++;
+			while ($i < $len && ctype_space($text[$i])) {
+				$i++;
+			}
+			if (preg_match('/\Gfunction\b/i', $text, $fm, 0, $i)) {
+				$bodyInfo = extract_lua_function_body_at($text, $i);
+				if ($bodyInfo !== null) {
+					$inlineBody = $bodyInfo[0];
+					$inlineBodyStart = $bodyInfo[1];
+				}
+			} elseif (preg_match('/\G([A-Za-z_][A-Za-z0-9_]*)/', $text, $nm, 0, $i)) {
+				$callback = $nm[1];
+			}
+		}
+		$binding = array(
 			'event' => $event,
 			'npc_id' => $npcId,
 			'npc_token' => $token,
 			'callback' => $callback,
-			'line_no' => lua_offset_to_line($text, $m[0][1]),
+			'inline_body' => $inlineBody,
+			'inline_body_start' => $inlineBodyStart,
+			'line_no' => lua_offset_to_line($text, $matchStart),
+			'_match_offset' => $matchStart,
 		);
+		if ($npcId === null && preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $token)) {
+			$expanded = expand_binding_from_ipairs_loop($text, $binding, $arrays);
+			if ($expanded !== null) {
+				foreach ($expanded as $eb) {
+					$out[] = $eb;
+				}
+				continue;
+			}
+		}
+		unset($binding['_match_offset']);
+		$out[] = $binding;
 	}
 	return $out;
 }
@@ -1299,7 +1510,7 @@ function parse_lua_text($raw, $rel) {
 	$sayLocals = extract_lua_local_int_consts($raw);
 	$result['_locals'] = $sayLocals;
 
-	// Named Event.say / Event.trade callbacks → per-NPC content
+	// Named / inline Event.say / Event.trade callbacks → per-NPC content
 	$callbackCache = array(); // name => parsed {trades, says, hints} or false
 	$namedSayTrade = false;
 	foreach ($bindings as $b) {
@@ -1316,41 +1527,54 @@ function parse_lua_text($raw, $rel) {
 			);
 			continue;
 		}
-		if ($b['callback'] === null || $b['callback'] === '') {
+		$bag = null;
+		if (!empty($b['inline_body'])) {
+			$namedSayTrade = true;
+			$bodyLines = explode("\n", $b['inline_body']);
+			$lineOffset = lua_offset_to_line($raw, (int)$b['inline_body_start']) - 1;
+			$bag = array(
+				'trades' => array(),
+				'say_branches' => array(),
+				'unsupported_hints' => array(),
+				'_locals' => $sayLocals,
+			);
+			extract_trades_from_lines($bag, $bodyLines, $rel, $lineOffset);
+			$bag['say_branches'] = extract_say_branches_from_lines($bodyLines, $rel, $sayLocals, $lineOffset, $bag['unsupported_hints']);
+		} elseif ($b['callback'] === null || $b['callback'] === '') {
 			// 3-arg registration: no named callback; classic path may still apply.
 			continue;
-		}
-		$namedSayTrade = true;
-		$cb = $b['callback'];
-		if (!array_key_exists($cb, $callbackCache)) {
-			$bodyInfo = extract_lua_function_body($raw, $cb);
-			if ($bodyInfo === null) {
-				$callbackCache[$cb] = false;
-			} else {
-				$bodyLines = explode("\n", $bodyInfo[0]);
-				$lineOffset = lua_offset_to_line($raw, $bodyInfo[1]) - 1;
-				$bag = array(
-					'trades' => array(),
-					'say_branches' => array(),
-					'unsupported_hints' => array(),
-					'_locals' => $sayLocals,
-				);
-				// Always allow trade scan in body; say scan too — content is event-typed by binding.
-				extract_trades_from_lines($bag, $bodyLines, $rel, $lineOffset);
-				$bag['say_branches'] = extract_say_branches_from_lines($bodyLines, $rel, $sayLocals, $lineOffset, $bag['unsupported_hints']);
-				$callbackCache[$cb] = $bag;
+		} else {
+			$namedSayTrade = true;
+			$cb = $b['callback'];
+			if (!array_key_exists($cb, $callbackCache)) {
+				$bodyInfo = extract_lua_function_body($raw, $cb);
+				if ($bodyInfo === null) {
+					$callbackCache[$cb] = false;
+				} else {
+					$bodyLines = explode("\n", $bodyInfo[0]);
+					$lineOffset = lua_offset_to_line($raw, $bodyInfo[1]) - 1;
+					$tmp = array(
+						'trades' => array(),
+						'say_branches' => array(),
+						'unsupported_hints' => array(),
+						'_locals' => $sayLocals,
+					);
+					extract_trades_from_lines($tmp, $bodyLines, $rel, $lineOffset);
+					$tmp['say_branches'] = extract_say_branches_from_lines($bodyLines, $rel, $sayLocals, $lineOffset, $tmp['unsupported_hints']);
+					$callbackCache[$cb] = $tmp;
+				}
 			}
+			if ($callbackCache[$cb] === false) {
+				$result['unsupported_hints'][] = array(
+					'kind' => 'unresolved_callback',
+					'line_no' => $b['line_no'],
+					'script_file' => $rel,
+					'detail' => $cb,
+				);
+				continue;
+			}
+			$bag = $callbackCache[$cb];
 		}
-		if ($callbackCache[$cb] === false) {
-			$result['unsupported_hints'][] = array(
-				'kind' => 'unresolved_callback',
-				'line_no' => $b['line_no'],
-				'script_file' => $rel,
-				'detail' => $cb,
-			);
-			continue;
-		}
-		$bag = $callbackCache[$cb];
 		foreach ($bag['unsupported_hints'] as $h) {
 			$result['unsupported_hints'][] = $h;
 		}
@@ -1402,7 +1626,7 @@ function parse_lua_text($raw, $rel) {
 	$tradeLines = extract_event_trade_lines($lines);
 	$hasNamedTrade = false;
 	foreach ($bindings as $b) {
-		if ($b['event'] === 'trade' && $b['callback']) {
+		if ($b['event'] === 'trade' && ($b['callback'] || !empty($b['inline_body']))) {
 			$hasNamedTrade = true;
 			break;
 		}

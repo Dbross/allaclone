@@ -63,8 +63,9 @@ From each zone’s `*.lua` scripts:
 - `e.other:Faction(e.self, id, delta)` hits (attributed to the turn-in branch when inside that branch)
 - `GetFactionValue(e.self) >= N` standing gates (mapped to the NPC’s primary faction — **heuristic**)
 - `event_say` / `:findi("keyword")` dialogue branches (including spawn/depop-only branches)
-- Named encounter handlers: `eq.register_npc_event(..., Event.say|Event.trade, <npc_id|local const>, Callback)` — dialogue/trades are extracted from the named callback and attributed **only** to that NPC id (death/spawn/combat registrations do not inherit quest content)
-- Death→spawn edges into `quest_death_spawn`: classic `event_death` / `event_death_complete`, and named `Event.death` / `Event.death_complete` callbacks that call `spawn2` / `unique_spawn` (literal or local-const NPC id; literal coords kept, corpse/`GetX` coords stored as NULL)
+- Named / inline encounter handlers: `eq.register_npc_event(..., Event.say|Event.trade|Event.death*, <npc_id|local const>, Callback|function(...) ... end)` — dialogue/trades attributed **only** to that NPC id; death handlers yield `quest_death_spawn` edges (spawn/combat registrations do not inherit quest content)
+- `for _, id in ipairs(local_int_array)` registrations expand to each literal array id
+- Death→spawn edges into `quest_death_spawn`: classic `event_death` / `event_death_complete`, named and **inline** `Event.death` / `Event.death_complete` callbacks with direct `spawn2` / `unique_spawn`, plus **one-level** helper call-graph (e.g. `ActivateAvatar(fake, real)` whose body spawns `real`) (literal or local-const NPC id; literal coords kept, corpse/`GetX` coords stored as NULL)
 - **Sirran exception:** `quests/manual_sirran.php` adds timer / combat notes for `airplane/encounters/Sirran.lua` (death→spawn comes from generic extraction)
 - Literal `eq.spawn2` / `eq.unique_spawn` (and `quest::` equivalents) with numeric x/y/z into `quest_spawn`
 - Literal `MovePC(zone, x, y, z[, h])` on the player (`e.other` / `e.self` / `CastToClient()`): annotated on say/`event_enter` branches and on turn-ins via `quest_trade.effect_notes` (non-literal destinations are hinted, not invented)
@@ -79,9 +80,9 @@ Dry-run and final import summaries report aggregated `unsupported_hints` (by kin
 - Variable / concatenated item ids
 - `eq.ChooseRandom` / `math.random` item slots (not recorded as guaranteed rewards; literal items with random coins may be kept with a partial hint)
 - Dynamic spawn coords (`GetX()` etc.) for `quest_spawn` map points (death edges still record the NPC link with NULL coords)
-- Inline anonymous `register_npc_event(..., function(e) …)` death handlers
-- Death spawns via helper functions / call graphs (e.g. `ActivateAvatar`) or `eq.ChooseRandom` NPC ids
-- `register_npc_event` NPC ids that are bare loop variables (no literal/local-const 3rd arg)
+- Helper death spawns beyond one call level, or helpers whose spawn NPC id cannot be bound from call args
+- `eq.ChooseRandom` / non-literal NPC ids in death `spawn2` / `unique_spawn`
+- `register_npc_event` NPC ids that are bare loop variables **outside** `for _, id in ipairs(local_int_array)`
 - Deep nesting beyond the indent heuristic
 
 Treat summaries as approximate. Fixture tests live under `quests/tests/`.
